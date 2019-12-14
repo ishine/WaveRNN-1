@@ -10,19 +10,31 @@ from utils.dsp import *
 import sys
 import time
 from layers.overtone import Overtone
-from layers.vector_quant import VectorQuant
+from layers.vector_quant import *
 from layers.downsampling_encoder import DownsamplingEncoder
 import utils.env as env
 import utils.logger as logger
 import random
+from layers.singular_loss import SingularLoss
+
+__model_factory = {
+    'vqvae': VectorQuant,
+    'vqvae_group': VectorQuantGroup,
+}
+
+def init_vq(name, *args, **kwargs):
+    if name not in list(__model_factory.keys()):
+        raise KeyError("Unknown models: {}".format(name))
+    return __model_factory[name](*args, **kwargs)
 
 class Model(nn.Module) :
-    def __init__(self, rnn_dims, fc_dims, global_decoder_cond_dims, upsample_factors, normalize_vq=False,
-            noise_x=False, noise_y=False):
+    def __init__(self, model_type, rnn_dims, fc_dims, global_decoder_cond_dims, upsample_factors, num_group, num_sample,
+                 normalize_vq=False, noise_x=False, noise_y=False):
         super().__init__()
-        self.n_classes = 256
+        # self.n_classes = 256
         self.overtone = Overtone(rnn_dims, fc_dims, 128, global_decoder_cond_dims)
-        self.vq = VectorQuant(1, 512, 128, normalize=normalize_vq)
+        # self.vq = VectorQuant(1, 410, 128, normalize=normalize_vq)
+        self.vq = init_vq(model_type, 1, 410, 128, num_group, num_sample, normalize=normalize_vq)
         self.noise_x = noise_x
         self.noise_y = noise_y
         encoder_layers = [
@@ -125,15 +137,15 @@ class Model(nn.Module) :
     def total_scale(self):
         return self.encoder.total_scale
 
-    def do_train(self, paths, dataset, optimiser, epochs, batch_size, step, lr=1e-4, valid_index=[], use_half=False, do_clip=False):
+    def do_train(self, paths, dataset, optimiser, writer, epochs, test_epochs, batch_size, step, epoch, valid_index=[], use_half=False, do_clip=False, beta=0.):
 
         if use_half:
             import apex
             optimiser = apex.fp16_utils.FP16_Optimizer(optimiser, dynamic_loss_scale=True)
-        for p in optimiser.param_groups : p['lr'] = lr
+        # for p in optimiser.param_groups : p['lr'] = lr
         criterion = nn.NLLLoss().cuda()
-        k = 0
-        saved_k = 0
+        # k = 0
+        # saved_k = 0
         pad_left = self.pad_left()
         pad_left_encoder = self.pad_left_encoder()
         pad_left_decoder = self.pad_left_decoder()
@@ -145,7 +157,7 @@ class Model(nn.Module) :
         window = 16 * self.total_scale()
         logger.log(f'pad_left={pad_left_encoder}|{pad_left_decoder}, pad_right={pad_right}, total_scale={self.total_scale()}')
 
-        for e in range(epochs) :
+        for e in range(epoch, epochs) :
 
             trn_loader = DataLoader(dataset, collate_fn=lambda batch: env.collate_multispeaker_samples(pad_left, window, pad_right, batch), batch_size=batch_size,
                                     num_workers=2, shuffle=True, pin_memory=True)
@@ -161,7 +173,7 @@ class Model(nn.Module) :
 
             iters = len(trn_loader)
 
-            for i, (speaker, wave16) in enumerate(trn_loader) :
+            for i, (speaker, wave16) in enumerate(trn_loader):
 
                 speaker = speaker.cuda()
                 wave16 = wave16.cuda()
@@ -259,20 +271,124 @@ class Model(nn.Module) :
 
                 step += 1
                 k = step // 1000
-                logger.status(f'Epoch: {e+1}/{epochs} -- Batch: {i+1}/{iters} -- Loss: c={avg_loss_c:#.4} f={avg_loss_f:#.4} vq={avg_loss_vq:#.4} vqc={avg_loss_vqc:#.4} -- Entropy: {avg_entropy:#.4} -- Grad: {running_max_grad:#.1} {running_max_grad_name} Speed: {speed:#.4} steps/sec -- Step: {k}k ')
+                logger.status(f'[Training] Epoch: {e+1}/{epochs} -- Batch: {i+1}/{iters} -- Loss: c={avg_loss_c:#.4} f={avg_loss_f:#.4} vq={avg_loss_vq:#.4} vqc={avg_loss_vqc:#.4} -- Entropy: {avg_entropy:#.4} -- Grad: {running_max_grad:#.1} {running_max_grad_name} Speed: {speed:#.4} steps/sec -- Step: {k}k ')
+
+                # tensorboard writer
+                writer.add_scalars('Train/loss_group', {'loss_c': loss_c.item(),
+                                                        'loss_f': loss_f.item(),
+                                                        'vq': vq_pen.item(),
+                                                        'vqc': encoder_pen.item(),
+                                                        'entropy': entropy,}, step - 1)
 
             os.makedirs(paths.checkpoint_dir, exist_ok=True)
-            torch.save(self.state_dict(), paths.model_path())
-            np.save(paths.step_path(), step)
+            torch.save({'epoch': e,
+                        'state_dict': self.state_dict(),
+                        'optimiser': optimiser.state_dict(),
+                        'step': step},
+                       paths.model_path())
+            # torch.save(self.state_dict(), paths.model_path())
+            # np.save(paths.step_path(), step)
             logger.log_current_status()
-            logger.log(f' <saved>; w[0][0] = {self.overtone.wavernn.gru.weight_ih_l0[0][0]}')
-            if k > saved_k + 50:
-                torch.save(self.state_dict(), paths.model_hist_path(step))
-                saved_k = k
-                self.do_generate(paths, step, dataset.path, valid_index)
+            # logger.log(f' <saved>; w[0][0] = {self.overtone.wavernn.gru.weight_ih_l0[0][0]}')
 
-    def do_generate(self, paths, step, data_path, test_index, deterministic=False, use_half=False, verbose=False):
+            if e % test_epochs == 0:
+                torch.save({'epoch': e,
+                            'state_dict': self.state_dict(),
+                            'optimiser': optimiser.state_dict(),
+                            'step': step},
+                           paths.model_hist_path(step))
+                self.do_test(writer, e, step, dataset.path, valid_index)
+                self.do_test_generate(paths, step, dataset.path, valid_index)
+            # if k > saved_k + 50:
+            #     torch.save({'epoch': e,
+            #                 'state_dict': self.state_dict(),
+            #                 'optimiser': optimiser.state_dict(),
+            #                 'step': step},
+            #                paths.model_hist_path(step))
+            #     # torch.save(self.state_dict(), paths.model_hist_path(step))
+            #     saved_k = k
+            #     self.do_generate(paths, step, dataset.path, valid_index)
+
+    def do_test(self, writer, epoch, step, data_path, test_index):
+        dataset = env.MultispeakerDataset(test_index, data_path)
+        criterion = nn.NLLLoss().cuda()
+        # k = 0
+        # saved_k = 0
+        pad_left = self.pad_left()
+        pad_left_encoder = self.pad_left_encoder()
+        pad_left_decoder = self.pad_left_decoder()
+        extra_pad_right = 0
+        pad_right = self.pad_right() + extra_pad_right
+        window = 16 * self.total_scale()
+
+        test_loader = DataLoader(dataset, collate_fn=lambda batch: env.collate_multispeaker_samples(pad_left, window, pad_right, batch),
+                            batch_size=16, num_workers=2, shuffle=False, pin_memory=True)
+
+        running_loss_c = 0.
+        running_loss_f = 0.
+        running_loss_vq = 0.
+        running_loss_vqc = 0.
+        running_entropy = 0.
+        running_max_grad = 0.
+        running_max_grad_name = ""
+
+        for i, (speaker, wave16) in enumerate(test_loader):
+            speaker = speaker.cuda()
+            wave16 = wave16.cuda()
+
+            coarse = (wave16 + 2 ** 15) // 256
+            fine = (wave16 + 2 ** 15) % 256
+
+            coarse_f = coarse.float() / 127.5 - 1.
+            fine_f = fine.float() / 127.5 - 1.
+            total_f = (wave16.float() + 0.5) / 32767.5
+
+            noisy_f = total_f
+
+            x = torch.cat([
+                coarse_f[:, pad_left - pad_left_decoder:-pad_right].unsqueeze(-1),
+                fine_f[:, pad_left - pad_left_decoder:-pad_right].unsqueeze(-1),
+                coarse_f[:, pad_left - pad_left_decoder + 1:1 - pad_right].unsqueeze(-1),
+            ], dim=2)
+            y_coarse = coarse[:, pad_left + 1:1 - pad_right]
+            y_fine = fine[:, pad_left + 1:1 - pad_right]
+
+            translated = noisy_f[:, pad_left - pad_left_encoder:]
+
+            p_cf, vq_pen, encoder_pen, entropy = self(speaker, x, translated)
+            p_c, p_f = p_cf
+            loss_c = criterion(p_c.transpose(1, 2).float(), y_coarse)
+            loss_f = criterion(p_f.transpose(1, 2).float(), y_fine)
+            # encoder_weight = 0.01 * min(1, max(0.1, step / 1000 - 1))
+            # loss = loss_c + loss_f + vq_pen + encoder_weight * encoder_pen
+
+            running_loss_c += loss_c.item()
+            running_loss_f += loss_f.item()
+            running_loss_vq += vq_pen.item()
+            running_loss_vqc += encoder_pen.item()
+            running_entropy += entropy
+
+        avg_loss_c = running_loss_c / (i + 1)
+        avg_loss_f = running_loss_f / (i + 1)
+        avg_loss_vq = running_loss_vq / (i + 1)
+        avg_loss_vqc = running_loss_vqc / (i + 1)
+        avg_entropy = running_entropy / (i + 1)
+
         k = step // 1000
+        logger.log(
+            f'[Testing] Epoch: {epoch} -- Loss: c={avg_loss_c:#.4} f={avg_loss_f:#.4} vq={avg_loss_vq:#.4} vqc={avg_loss_vqc:#.4} -- Entropy: {avg_entropy:#.4} -- Grad: {running_max_grad:#.1} {running_max_grad_name} -- Step: {k}k ')
+
+        # tensorboard writer
+        writer.add_scalars('Test/loss_group', {'loss_c': avg_loss_c,
+                                                'loss_f': avg_loss_f,
+                                                'vq': avg_loss_vq,
+                                                'vqc': avg_loss_vqc,
+                                                'entropy': avg_entropy, }, step - 1)
+
+
+    def do_test_generate(self, paths, step, data_path, test_index, deterministic=False, use_half=False, verbose=False):
+        k = step // 1000
+        test_index = [x[:2] if len(x) > 0 else [] for i, x in enumerate(test_index)]
         dataset = env.MultispeakerDataset(test_index, data_path)
         loader = DataLoader(dataset, shuffle=False)
         data = [x for x in loader]
@@ -284,6 +400,7 @@ class Model(nn.Module) :
         aligned = [torch.cat([torch.FloatTensor(x), torch.zeros(maxlen-len(x))]) for x in extended]
         os.makedirs(paths.gen_path(), exist_ok=True)
         out = self.forward_generate(torch.stack(speakers + list(reversed(speakers)), dim=0).cuda(), torch.stack(aligned + aligned, dim=0).cuda(), verbose=verbose, use_half=use_half)
+
         logger.log(f'out: {out.size()}')
         for i, x in enumerate(gt) :
             librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_target.wav', x.cpu().numpy(), sr=sample_rate)
@@ -291,3 +408,49 @@ class Model(nn.Module) :
             librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_generated.wav', audio, sr=sample_rate)
             audio_tr = out[n_points+i][:len(x)].cpu().numpy()
             librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_transferred.wav', audio_tr, sr=sample_rate)
+
+
+
+    def do_generate(self, paths, step, data_path, test_index, deterministic=False, use_half=False, verbose=False):
+        k = step // 1000
+        test_index = [x[:10] if len(x) > 0 else [] for i, x in enumerate(test_index)]
+        test_index[0] = []
+        test_index[1] = []
+        test_index[2] = []
+        # test_index[3] = []
+
+        dataset = env.MultispeakerDataset(test_index, data_path)
+        loader = DataLoader(dataset, shuffle=False)
+        data = [x for x in loader]
+        n_points = len(data)
+        gt = [(x[0].float() + 0.5) / (2**15 - 0.5) for speaker, x in data]
+        extended = [np.concatenate([np.zeros(self.pad_left_encoder(), dtype=np.float32), x, np.zeros(self.pad_right(), dtype=np.float32)]) for x in gt]
+        speakers = [torch.FloatTensor(speaker[0].float()) for speaker, x in data]
+
+        vc_speakers = [torch.FloatTensor((np.arange(30) == 1).astype(np.float)) for _ in range(10)]
+        # vc_speakers = [torch.FloatTensor((np.arange(30) == 14).astype(np.float)) for _ in range(20)]
+        # vc_speakers = [torch.FloatTensor((np.arange(30) == 23).astype(np.float)) for _ in range(20)]
+        # vc_speakers = [torch.FloatTensor((np.arange(30) == 4).astype(np.float)) for _ in range(20)]
+        maxlen = max([len(x) for x in extended])
+        aligned = [torch.cat([torch.FloatTensor(x), torch.zeros(maxlen-len(x))]) for x in extended]
+        os.makedirs(paths.gen_path(), exist_ok=True)
+        # out = self.forward_generate(torch.stack(speakers + list(reversed(speakers)), dim=0).cuda(), torch.stack(aligned + aligned, dim=0).cuda(), verbose=verbose, use_half=use_half)
+        out = self.forward_generate(torch.stack(vc_speakers, dim=0).cuda(),
+                                    torch.stack(aligned, dim=0).cuda(), verbose=verbose, use_half=use_half)
+        logger.log(f'out: {out.size()}')
+        # for i, x in enumerate(gt) :
+        #     librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_target.wav', x.cpu().numpy(), sr=sample_rate)
+        #     audio = out[i][:len(x)].cpu().numpy()
+        #     librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_generated.wav', audio, sr=sample_rate)
+        #     audio_tr = out[n_points+i][:len(x)].cpu().numpy()
+        #     librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_transferred.wav', audio_tr, sr=sample_rate)
+
+        for i, x in enumerate(gt):
+            # librosa.output.write_wav(f'{paths.gen_path()}/gsb_{i+1:04d}.wav', x.cpu().numpy(), sr=sample_rate)
+            # librosa.output.write_wav(f'{paths.gen_path()}/gt_gsb_{i+1:03d}.wav', x.cpu().numpy(), sr=sample_rate)
+            # audio = out[i][:len(x)].cpu().numpy()
+            # librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_generated.wav', audio, sr=sample_rate)
+            # audio_tr = out[n_points+i][:len(x)].cpu().numpy()
+            audio_tr = out[i][:self.pad_left_encoder() + len(x)].cpu().numpy()
+            # librosa.output.write_wav(f'{paths.gen_path()}/{k}k_steps_{i}_transferred.wav', audio_tr, sr=sample_rate)
+            librosa.output.write_wav(f'{paths.gen_path()}/gsb_{i + 1:04d}.wav', audio_tr, sr=sample_rate)

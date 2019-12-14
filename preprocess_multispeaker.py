@@ -9,17 +9,14 @@ SEG_PATH = sys.argv[1]
 DATA_PATH = sys.argv[2]
 
 def get_files(path):
-    next_speaker_id = 0
-    speaker_ids = {}
     filenames = []
-    for filename in glob.iglob(f'{path}/**/*.wav', recursive=True):
-        speaker_name = filename.split('/')[-2]
-        if speaker_name not in speaker_ids:
-            speaker_ids[speaker_name] = next_speaker_id
-            next_speaker_id += 1
-            filenames.append([])
-        filenames[speaker_ids[speaker_name]].append(filename)
-
+    speakers = sorted(os.listdir(path))
+    for speaker in speakers:
+        filenames_speaker = []
+        files = sorted(os.listdir(f'{path}/{speaker}'))
+        for file in files:
+            filenames_speaker.append(os.path.join(path, speaker, file))
+        filenames.append(filenames_speaker)
     return filenames
 
 files = get_files(SEG_PATH)

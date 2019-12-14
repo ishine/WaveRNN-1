@@ -106,15 +106,20 @@ def collate(left_pad, mel_win, right_pad, batch) :
 
     return mels, coarse, fine, coarse_f, fine_f
 
-def restore(path, model):
-    model.load_state_dict(torch.load(path))
+def restore(path, model, optimiser):
+    checkpoint = torch.load(path)
+    model.load_state_dict(checkpoint['state_dict'])
+    optimiser.load_state_dict(checkpoint['optimiser'])
+    step = checkpoint['step']
+    epoch = checkpoint['epoch'] + 1
 
-    match = re.search(r'_([0-9]+)\.pyt', path)
-    if match:
-        return int(match.group(1))
-
-    step_path = re.sub(r'\.pyt', '_step.npy', path)
-    return np.load(step_path)
+    # match = re.search(r'_([0-9]+)\.pyt', path)
+    # if match:
+    #     return int(match.group(1))
+    #
+    # step_path = re.sub(r'\.pyt', '_step.npy', path)
+    # return np.load(step_path)
+    return step, epoch
 
 if __name__ == '__main__':
     import pickle

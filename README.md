@@ -1,30 +1,23 @@
-# WaveRNN + VQ-VAE
+# Group Latent Embedding for Vector Quantized Variational Autoencoder in Non-Parallel Voice Conversion
 
-This is a Pytorch implementation of [WaveRNN](
-https://arxiv.org/abs/1802.08435v1). Currently 3 top-level networks are
-provided:
+Code for this paper [Group Latent Embedding for Vector Quantized Variational Autoencoder in Non-Parallel Voice Conversion](https://www.isca-speech.org/archive/Interspeech_2019/pdfs/1198.pdf)
 
-* A [VQ-VAE](https://avdnoord.github.io/homepage/vqvae/) implementation with a
-  WaveRNN decoder. Trained on a multispeaker dataset of speech, it can
-  demonstrate speech reconstruction and speaker conversion.
-* A vocoder implementation. Trained on a single-speaker dataset, it can turn a
-  mel spectrogram into raw waveform.
-* An unconditioned WaveRNN. Trained on a single-speaker dataset, it can generate
-  random speech.
+Shaojin Ding, Ricardo Gutierrez-Osuna
 
-[Audio samples](https://mkotha.github.io/WaveRNN/).
+In INTERSPEECH 2019
 
-It has been tested with the following datasets.
+This is a Pytorch implementation. This implementation is based on the VQ-VAE-WaveRNN implementation at [https://github.com/mkotha/WaveRNN](https://github.com/mkotha/WaveRNN).
 
-Multispeaker datasets:
+## Dataset:
 
 * [VCTK](https://datashare.is.ed.ac.uk/handle/10283/2651)
-
-Single-speaker datasets:
-
-* [LJ Speech](https://keithito.com/LJ-Speech-Dataset/)
+  * [Audio samples](https://shaojinding.github.io/samples/gle/gle_demo).
+  *  [Trained model](https://drive.google.com/file/d/1W4lA37_susadCY5UQUPPbaqKbRNfNUW7/view?usp=sharing).
 
 ## Preparation
+
+The preparation is similar to that at [https://github.com/mkotha/WaveRNN](https://github.com/mkotha/WaveRNN). We repeat it here for convenience.
+
 
 ### Requirements
 
@@ -52,27 +45,16 @@ You can skip this section if you don't need a multi-speaker dataset.
 3. In `config.py`, set `multi_speaker_data_path` to point to the output
   directory.
 
-### Preparing LJ-Speech
-
-You can skip this section if you don't need a single-speaker dataset.
-
-1. Download and uncompress [the LJ speech dataset](
-  https://keithito.com/LJ-Speech-Dataset/).
-2. `python preprocess16.py /path/to/dataset/LJSpeech-1.1/wavs
-  /path/to/output/directory`
-3. In `config.py`, set `single_speaker_data_path` to point to the output
-  directory.
 
 ## Usage
 
-`wavernn.py` is the entry point:
+To run Group Latent Embedding:
 
 ```
-$ python wavernn.py
+$ python wavernn.py -m vqvae_group --num-group 41 --num-sample 10
 ```
 
-By default, it trains a VQ-VAE model. The `-m` option can be used to tell the
-the script to train a different model.
+The `-m` option can be used to tell the the script what model to train. By default, it trains a vanilla VQ-VAE model. 
 
 Trained models are saved under the `model_checkpoints` directory.
 
@@ -85,47 +67,21 @@ goes under the `model_outputs` directory.
 When the `-g` option is given, the script produces the output using the saved
 model, rather than training it.
 
-# Deviations from the papers
-
-I deviated from the papers in some details, sometimes because I was lazy, and
-sometimes because I was unable to get good results without it. Below is a
-(probably incomplete) list of deviations.
-
-All models:
-
-* The sampling rate is 22.05kHz.
-
-VQ-VAE:
-
-* I normalize each latent embedding vector, so that it's on the unit 128-
-  dimensional sphere. Without this change, I was unable to get good utilization
-  of the embedding vectors.
-* In the early stage of training, I scale with a small number the penalty term
-  that apply to the input to the VQ layer. Without this, the input very often
-  collapses into a degenerate distribution which always selects the same
-  embedding vector.
-* During training, the target audio signal (which is also the input signal) is
-  translated along the time axis by a random amount, uniformly chosen from
-  [-128, 127] samples. Less importantly, some additive and multiplicative
-  Gaussian noise is also applied to each audio sample. Without these types of
-  noise, the feature captured by the model tended to be very sensitive to small
-  purterbations to the input, and the subjective quality of the model output
-  kept descreasing after a certain point in training.
-* The decoder is based on WaveRNN instead of WaveNet. See the next section for
-  details about this network.
-
-# Context stacks
-
-The VQ-VAE implementation uses a WaveRNN-based decoder instead of a WaveNet-
-based decoder found in the paper. This is a WaveRNN network augmented
-with a context stack to extend the receptive field.  This network is
-defined in `layers/overtone.py`.
-
-The network has 6 convolutions with stride 2 to generate 64x downsampled
-'summary' of the waveform, and then 4 layers of upsampling RNNs, the last of
-which is the WaveRNN layer. It also has U-net-like skip connections that
-connect layers with the same operating frequency.
+`--num-group` specifies the number of groups. `--num-sample` specifies the number of atoms in each group. Note that num-group times num-sample should be equal to the total number of atoms in the embedding dictionary (`n_classes` in class `VectorQuantGroup` in `vector_quant.py`)
 
 # Acknowledgement
 
-The code is based on [fatchord/WaveRNN](https://github.com/fatchord/WaveRNN).
+The code is based on [mkotha/WaveRNN](https://github.com/mkotha/WaveRNN).
+
+# Cite the work
+```
+@inproceedings{Ding2019,
+  author={Shaojin Ding and Ricardo Gutierrez-Osuna},
+  title={{Group Latent Embedding for Vector Quantized Variational Autoencoder in Non-Parallel Voice Conversion}},
+  year=2019,
+  booktitle={Proc. Interspeech 2019},
+  pages={724--728},
+  doi={10.21437/Interspeech.2019-1198},
+  url={http://dx.doi.org/10.21437/Interspeech.2019-1198}
+}
+```
